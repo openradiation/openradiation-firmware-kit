@@ -104,6 +104,8 @@ int ppi_led ;
 const int nb_leds = NB_PIXELS*3;
 uint8_t leds[nb_leds];
 
+uint32_t bits[48];
+
 void TIMER1_INTERUPT(void) {
   if (NRF_TIMER1->EVENTS_COMPARE[0] != 0) {
     if (pwm_count < pwm_duty_cycle) {
@@ -205,6 +207,7 @@ void enableFollowerLED(){
   rfduino_ppi_channel_assign(ppi_led, &NRF_GPIOTE->EVENTS_IN[GPIOTE_FOLLOW], &NRF_GPIOTE->TASKS_OUT[GPIOTE_LED]);
 }
 
+/*
 // Gestion des leds
 // http://forum.rfduino.com/index.php?topic=30.30
 void setRGB(int led, uint8_t r, uint8_t g, uint8_t b) {
@@ -246,16 +249,117 @@ void showLeds() {
   delayMicroseconds(50); // latch and reset WS2812.
   interrupts();  
 }
+*/
+
+void ws2812_write1value( int led, uint32_t pin, uint32_t r, uint32_t g, uint32_t b) {
+  //uint32_t bits[24];
+  // to not loss time in computation later, transform the 
+  // int value into 32 bit
+  // value directly orgnized to be send to GPIO port
+  int j=0;
+  int led_offset = led * 24;
+  for (int i=7 ; i >= 0 ; i--,j++) bits[led_offset + j] = ( ( r >> i ) & 0x01 ) << pin;
+  for (int i=7 ; i >= 0 ; i--,j++) bits[led_offset + j] = ( ( g >> i ) & 0x01 ) << pin;
+  for (int i=7 ; i >= 0 ; i--,j++) bits[led_offset + j] = ( ( b >> i ) & 0x01 ) << pin;
+}
+
+void showLeds(uint32_t pin)
+{
+  volatile uint32_t * outset = &NRF_GPIO->OUTSET;
+  volatile uint32_t * outclr = &NRF_GPIO->OUTCLR;
+  uint32_t * _ptbits = bits;
+  int _b = 1 << pin;
+
+  noInterrupts();
+  asm volatile (
+    "headD:\n\t"
+      "push {r2,r3,r4,r5,r6,r7}\n\t"
+      "mov  r5,%2\n\t"            // _ptbits (r1) 
+      "mov  r7,%0\n\t"            // outset  (r3)
+      "mov  r3,%1\n\t"            // outclr  (r2)
+      "mov  r2,%3\n\t"            // _b (r0) : value to write in register set/clr
+      "mov  r4,r5\n\t"
+      "add  r4,#200\n\t"          // r4 = b table ending address ( while ( _ptbits < r4 ) {  
+      "ldr  r6,[r5,#0] \n\t"      // _b = *_ptbits // 2 cycles (out of the main loop because too long )
+      "loopD: \n\t"                                // 5 cycles before write 1
+        "add r5,#4\n\t"           // _ptbits++     // cycle 1
+        "cmp r5,r4\n\t"           // _ptbits < r4 (end) // cycle 2 
+        "beq endloopD \n\t"                             // cycle 3 - 3 to 5 when taken
+        "str r2,[r7,#0] \n\t"     // *outset = _b       //  cycle 4-5 
+        "cmp r6,#0 \n\t"          // if ( _b != 00 )  { // cycle 1
+        "beq elseD \n\t"                                // cycle 2 - 2 to 4 when taken
+        "thenD:\n\t"                   // case 1 ( 11-15 cycle high then 5 - 9 cycle low )
+           "ldr  r6,[r5,#0] \n\t"      // _b = *_ptbits    // cycle 3-4 
+           "nop\n\t"                                    // cycle 5
+           "nop\n\t"                                    // cycle 6
+           "nop\n\t"                                    // cycle 7
+           "nop\n\t"                                    // cycle 8
+           "nop\n\t"                                    // cycle 9
+           "nop\n\t"                                    // cycle 10
+           "nop\n\t"                                    // cycle 11
+           "str r2,[r3,#0] \n\t"     // *outclr = _b    // cycle 12 - 13 
+                                                        // -- now 6 cycle for 0  
+           "b loopD \n\t"                               // cycle 1 to 3 
+                                       // --> 5 more cycle after = total 8 cycles 
+
+        "elseD:\n\t"                 // case 0          // else : 4-8 cycles for 1 and 12-16 cycles for 0
+           "str r2,[r3,#0] \n\t"     // *outclr = _b    // cycle 5-6 
+                                        // -- now 14 cycle for 0 (6 on top of loop=
+           "ldr r6,[r5,#0] \n\t"     // _b = *_ptbits   // cycle 1-2 (out of the main loop because too long )
+           "nop\n\t"                                    // cycle 3
+           "nop\n\t"                                    // cycle 4
+           "nop\n\t"                                    // cycle 5
+           "nop\n\t"                                    // cycle 6
+           "b loopD \n\t"                               // cycle 7 to 9 
+                                        // --> 5 more cycles after  
+
+      "endloopD: \n\t"
+      "pop {r2,r3,r4,r5,r6,r7}\n\t" 
+    ::
+    "r" (outset),   // %0
+    "r" (outclr),   // %1
+    "r" ( _ptbits), // %2
+    "r" (_b)        // %3
+ );
+ interrupts(); 
+ delayMicroseconds(60);
+} 
+
+void ws2812_init( uint32_t pin ) {
+   pinMode(pin, OUTPUT);
+   // 50 us low voltage for reset
+   NRF_GPIO->OUTCLR = ( 1 << pin );
+}
+
  
 void setup() {
   pinMode(PIN_PWM, OUTPUT);
   pinMode(PIN_MESURE_HT, INPUT);
   pinMode(PIN_COMPTEUR, INPUT);
-  pinMode(PIN_LEDS, OUTPUT);
-  
-  setRGB(LED_BLUETOOTH, 0, 0, 0);
-  setRGB(LED_ETAT, 0, 255, 0);
-  showLeds();
+
+  //pinMode(PIN_LEDS, OUTPUT);
+  //setRGB(LED_BLUETOOTH, 0, 0, 0);
+  //setRGB(LED_ETAT, 0, 255, 0);
+  //showLeds();
+
+  ws2812_init(PIN_LEDS);
+
+  ws2812_write1value(LED_BLUETOOTH,PIN_LEDS,255,0,0);
+  ws2812_write1value(LED_ETAT,PIN_LEDS,0,0,255);
+  showLeds(PIN_LEDS);
+  delay(1000);               // wait for a second
+  ws2812_write1value(LED_BLUETOOTH,PIN_LEDS,0,255,0);
+  ws2812_write1value(LED_ETAT,PIN_LEDS,255,0,0);
+  showLeds(PIN_LEDS);
+  delay(1000);               // wait
+  ws2812_write1value(LED_BLUETOOTH,PIN_LEDS,0,0,255);
+  ws2812_write1value(LED_ETAT,PIN_LEDS,0,255,0);
+  showLeds(PIN_LEDS);
+  delay(1000);   
+
+  ws2812_write1value(LED_BLUETOOTH,PIN_LEDS,0,0,0);
+  ws2812_write1value(LED_ETAT,PIN_LEDS,0,255,0);
+  showLeds(PIN_LEDS);
   
   analogReference(VBG); // Référence de 1.2V interne
  
@@ -285,8 +389,12 @@ void loop() {
 
 
    if ((alim_tension<BAT_LOW*100) && (!isBatLowOn)) {
-     setRGB(LED_ETAT, 32, 32, 0);
-     showLeds();
+     //setRGB(LED_ETAT, 32, 32, 0);
+     //showLeds();
+
+     ws2812_write1value(LED_ETAT ,PIN_LEDS, 32, 32, 0);
+     showLeds(PIN_LEDS);
+  
      isBatLowOn=1;
    }
 
@@ -336,17 +444,22 @@ void RFduinoBLE_onConnect() {
   sendLenString(OUT_PACKET_TUBE_TYPE,TUBE_TYPE,strlen(TUBE_TYPE));
   sendBuffer();
   
-  setRGB(LED_BLUETOOTH, 0, 0, 255); // Etat bluetooth
-  showLeds();
+  //setRGB(LED_BLUETOOTH, 0, 0, 255); // Etat bluetooth
+  //showLeds();
+  
+  ws2812_write1value(LED_BLUETOOTH ,PIN_LEDS, 0, 0, 255);
+  showLeds(PIN_LEDS);
 }
  
 void RFduinoBLE_onDisconnect() {
   RFduinoBLE_update_conn_interval(900, 1000);
   isCo = 0; // Un smartphone s'est déconnecté
-  setRGB(LED_BLUETOOTH, 0, 0, 0); // Etat bluetooth
-  showLeds();
+  //setRGB(LED_BLUETOOTH, 0, 0, 0); // Etat bluetooth
+  //showLeds();
+  
+  ws2812_write1value(LED_BLUETOOTH ,PIN_LEDS, 0, 0, 0);
+  showLeds(PIN_LEDS);
 }
-
 
 // called by rfduino lib when data is send by smartphone, with the data pointer and the used length
 // read only the first data, that is the data type and the first values
